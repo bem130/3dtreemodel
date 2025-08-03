@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>自然な木の3D画像生成プログラム - より自然な樹形へ</title>
+    <title>自然な木の3D画像生成プログラム - 形質の多様性</title>
     <style>
         body { margin: 0; font-family: sans-serif; overflow: hidden; }
         canvas { display: block; }
@@ -52,20 +52,23 @@
     <div id="controls">
         <div class="buttons">
             <button id="growButton">10ステップ成長</button>
-            <button id="autoGrowButton">自動成長 Start</button>
+            <button id="autoGrowButton">シミュレーション Start</button>
             <button id="resetButton">リセット</button>
         </div>
         <div class="control-panel">
             <label for="branchProb">枝の分岐しやすさ</label>
-            <input type="range" id="branchProb" min="0.1" max="1.0" step="0.05" value="0.7">
+            <input type="range" id="branchProb" min="0.1" max="1.0" step="0.05" value="0.6">
             <label for="apicalDom">上方への伸びる力</label>
-            <input type="range" id="apicalDom" min="0.0" max="0.5" step="0.01" value="0.15">
+            <input type="range" id="apicalDom" min="0.0" max="0.5" step="0.01" value="0.2">
             <label for="phototropism">光を求める力</label>
-            <input type="range" id="phototropism" min="0.0" max="0.3" step="0.01" value="0.1">
+            <input type="range" id="phototropism" min="0.0" max="0.3" step="0.01" value="0.15">
             <label for="gravity">重力の影響</label>
             <input type="range" id="gravity" min="0.0" max="0.2" step="0.01" value="0.08">
-            <label for="sparseBranch">疎な枝を埋める力</label>
-            <input type="range" id="sparseBranch" min="0.0" max="1.0" step="0.05" value="0.3">
+            <label for="speedSlider">シミュレーション速度</label>
+            <input type="range" id="speedSlider" min="10" max="200" step="10" value="100">
+            <!-- ★★★修正点: 色の多様性スライダーを追加★★★ -->
+            <label for="colorVariation">色の多様性</label>
+            <input type="range" id="colorVariation" min="0.0" max="0.2" step="0.01" value="0.05">
         </div>
     </div>
 
@@ -83,38 +86,63 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
         let scene, camera, renderer, controls, sunLight;
-        let tree;
-        let autoGrowInterval = null;
+        let trees = [];
+        let forestGroup; 
+        let simulationInterval = null;
+        let isFirstInit = true;
+        let cameraTarget = new THREE.Vector3(0, 15, 0);
 
-        // ★★★改善点: 樹形を制御するパラメータを刷新・追加★★★
         const config = {
-            branchingProbability: 0.7,
-            apicalDominance: 0.15,      // 頂芽優勢（上へ伸びる力）
-            phototropismStrength: 0.1,  // 光周性（光へ向かう力）
-            gravityStrength: 0.08,      // 重力の影響
+            // ★★★修正点: 色に関する設定を追加★★★
+            baseLeafColor: 0x208050,      // 葉の基本色
+            baseBranchColor: 0x8B4513,    // 枝の基本色
+            colorVariationFactor: 0.05, // 色の変化の度合い
+            
+            simulationIntervalMs: 100,
+            maturityNodeCount: 450,
+            spawnRadius: 25,
+            maxTrees: 15,
+            branchingProbability: 0.6,
+            apicalDominance: 0.2,
+            phototropismStrength: 0.15,
+            gravityStrength: 0.08,
+            directionPerturbation: 0.2,
+            sideBranchAngle: Math.PI / 3,
+            branchAngleVariance: 0.2,
             sparseBranchingProbability: 0.3,
             candidateCount: 20,
             trunkBranchingProbability: 0.2,
             maxChildren: 3,
-            
-            // --- 太さに関する設定 ---
-            initialThickness: 0.35,     // 幹の初期の太さ
-            maxThickness: 2.0,          // 枝が到達できる最大の太さ
-            secondaryGrowthRate: 0.005, // 二次成長（太くなる速さ）
-            lengthGrowthRate: 0.01,     // 長さの成長率
-
-            // --- 枝の形状に関する設定 ---
-            mainBranchAngle: Math.PI / 4, // 主枝の分岐角度(45度)
-            sideBranchAngle: Math.PI / 2.5, // 側枝の分岐角度(72度)
-            branchRotationVariance: 0.4,// 枝のねじれのばらつき
-
-            // --- 葉に関する設定 ---
-            maxPoints: 500000,
-            pointSize: 0.4,
-            influencePointsPerBranch: 2,
-            pointsPerInfluencePoint: 10,
+            initialThickness: 0.35,
+            maxThickness: 2.0,
+            secondaryGrowthRate: 0.005,
+            lengthGrowthRate: 0.01,
+            maxPointsPerTree: 50000,
+            pointSize: 0.3,
+            influencePointsPerBranch: 4,
+            pointsPerInfluencePoint: 16,
             leafScatter: 0.8,
         };
+
+        const GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0));
+
+        // ★★★追加: 色を突然変異させるヘルパー関数★★★
+        function mutateColor(baseColor, variation) {
+            const newColor = new THREE.Color(baseColor);
+            const hsl = {};
+            newColor.getHSL(hsl);
+
+            // H(色相), S(彩度), L(輝度) を少しだけずらす
+            hsl.h += (Math.random() - 0.5) * variation;
+            if (hsl.h < 0) hsl.h += 1;
+            if (hsl.h > 1) hsl.h -= 1;
+
+            hsl.s = Math.max(0.3, Math.min(1.0, hsl.s + (Math.random() - 0.5) * variation));
+            hsl.l = Math.max(0.2, Math.min(0.8, hsl.l + (Math.random() - 0.5) * variation));
+
+            newColor.setHSL(hsl.h, hsl.s, hsl.l);
+            return newColor;
+        }
 
         function gaussianRandom(mean = 0, stdev = 1) {
             const u = 1 - Math.random();
@@ -124,46 +152,49 @@
         }
 
         class Node {
-             // ★★★改善点: thicknessプロパティを追加し、太さを直接管理★★★
              constructor(parent, direction, length, thickness, depth) {
                 this.parent = parent;
                 this.children = [];
                 this.direction = direction.normalize();
                 this.length = length;
-                this.thickness = thickness; // 太さを直接保持
+                this.thickness = thickness;
                 this.isLeaf = true;
                 this.depth = depth;
                 this.endPoint = new THREE.Vector3();
                 this.hasLeaves = true;
+                this.roll = Math.random() * Math.PI * 2;
             }
         }
 
         class Tree {
-            constructor(scene, light) {
+            // ★★★修正点: コンストラクタで genetics (遺伝情報) を受け取る★★★
+            constructor(scene, light, basePosition, genetics) {
                 this.scene = scene;
                 this.sunLight = light;
-                this.branchGroup = new THREE.Group();
-                this.scene.add(this.branchGroup);
+                this.basePosition = basePosition;
+                this.genetics = genetics; // 自身の遺伝情報を保持
+                this.isMature = false;
+                this.nodeCount = 0;
 
-                const pointsGeometry = new THREE.BufferGeometry();
-                const positions = new Float32Array(config.maxPoints * 3);
-                pointsGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                this.branchGroup = new THREE.Group();
+                forestGroup.add(this.branchGroup);
                 
+                // ★★★修正点: 遺伝情報に基づいて、木ごとにマテリアルを生成★★★
+                this.branchMaterial = new THREE.MeshLambertMaterial({ color: this.genetics.branchColor });
                 const pointsMaterial = new THREE.PointsMaterial({
-                    color: 0x208050, 
+                    color: this.genetics.leafColor, 
                     size: config.pointSize,
-                    transparent: true,
-                    opacity: 0.6,
-                    blending: THREE.NormalBlending,
-                    depthWrite: true, 
-                    sizeAttenuation: true,
+                    transparent: true, opacity: 0.6,
+                    blending: THREE.NormalBlending, depthWrite: true, sizeAttenuation: true,
                 });
 
+                const pointsGeometry = new THREE.BufferGeometry();
+                const positions = new Float32Array(config.maxPointsPerTree * 3);
+                pointsGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
                 this.points = new THREE.Points(pointsGeometry, pointsMaterial);
-                this.scene.add(this.points);
+                forestGroup.add(this.points);
+                
                 this.pointCount = 0;
-
-                this.branchMaterial = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
                 this.allNodeEndpoints = [];
                 this.leafInfluencePoints = []; 
                 
@@ -171,68 +202,80 @@
             }
 
             init() {
-                while(this.branchGroup.children.length > 0){ this.branchGroup.remove(this.branchGroup.children[0]); }
-                if (this.points) {
-                    this.points.geometry.setDrawRange(0, 0);
-                    this.pointCount = 0;
-                }
-                // ★★★改善点: 初期ノードに太さ(thickness)を渡す★★★
                 this.base = new Node(null, new THREE.Vector3(0, 1, 0), 2.5, config.initialThickness, 0);
                 this.draw();
             }
-
-            // --- 成長ロジック (分岐部分を大幅に改善) ---
+            // ... (grow, _growFromLightCompetitionなどのロジックは変更なし) ...
             grow(steps = 1) {
+                if (this.isMature) return false;
                 let grown = false;
                 for (let i = 0; i < steps; i++) {
                     if (this._growFromLightCompetition()) grown = true;
                     if (Math.random() < config.trunkBranchingProbability) if (this._tryTrunkBranching()) grown = true;
                     if (Math.random() < config.sparseBranchingProbability) if (this._promoteSparseBranching()) grown = true;
                 }
-                if (grown) { this._updateLeafStatus(); this._applySecondaryGrowth(); this.draw(); }
+                if (grown) { 
+                    this._updateLeafStatus(); 
+                    this._applySecondaryGrowth(); 
+                    this.draw(); 
+                    if (!this.isMature && this.nodeCount > config.maturityNodeCount) {
+                        this.isMature = true;
+                        return 'matured';
+                    }
+                }
+                return grown;
             }
             
             _growFromLightCompetition() {
                 const leaves = this._findLeaves();
                 if (leaves.length === 0) return false;
-                let bestLeaf = null, maxDist = -1;
+                let bestLeaf = null;
+                let maxDist = -1;
+                const allObstaclePoints = trees.flatMap(tree => tree.allNodeEndpoints);
                 const candidates = [];
                 const candidateCount = Math.min(leaves.length, config.candidateCount);
-                for(let j=0; j<candidateCount; j++) candidates.push(leaves[Math.floor(Math.random()*leaves.length)]);
+                for(let j=0; j<candidateCount; j++) {
+                    candidates.push(leaves[Math.floor(Math.random()*leaves.length)]);
+                }
                 for (const leaf of candidates) {
                     let minDist = Infinity;
-                    for (const pos of this.allNodeEndpoints) { const d=leaf.endPoint.distanceTo(pos); if(d<minDist && d>0.001) minDist=d; }
-                    if (minDist > maxDist) { maxDist = minDist; bestLeaf = leaf; }
+                    for (const obstaclePos of allObstaclePoints) { 
+                        if (leaf.endPoint.equals(obstaclePos)) continue; 
+                        const d = leaf.endPoint.distanceTo(obstaclePos); 
+                        if (d < minDist) {
+                            minDist = d; 
+                        }
+                    }
+                    if (minDist > maxDist) { 
+                        maxDist = minDist; 
+                        bestLeaf = leaf; 
+                    }
                 }
-                if(bestLeaf){ if(Math.random()>0.1) this._branchFromLeaf(bestLeaf); else bestLeaf.length+=0.05; return true; }
+                if(bestLeaf){ 
+                    if(Math.random() > 0.1) this._branchFromLeaf(bestLeaf); 
+                    else bestLeaf.length += 0.05; 
+                    return true; 
+                }
                 return false;
             }
 
-            // ★★★改善点: 枝の分岐ロジックを全面的に刷新★★★
             _branchFromLeaf(leaf) {
                 if (leaf.children.length >= config.maxChildren) return;
                 leaf.isLeaf = false;
-
-                // 1. 主枝の生成
-                // 親の方向をベースに、頂芽優勢で少し上向きにする
-                let mainDir = leaf.direction.clone().lerp(new THREE.Vector3(0, 1, 0), config.apicalDominance).normalize();
-                
-                // 親の枝の方向から、少しランダムに傾ける
-                const randomAxis = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
-                const angle = config.branchRotationVariance * (Math.random() - 0.5);
-                mainDir.applyAxisAngle(randomAxis, angle);
-                
-                // 光と重力の影響を適用
+                let mainDir = leaf.direction.clone();
+                const perturbation = new THREE.Vector3(
+                    (Math.random() - 0.5) * config.directionPerturbation,
+                    (Math.random() - 0.5) * config.directionPerturbation,
+                    (Math.random() - 0.5) * config.directionPerturbation
+                );
+                mainDir.add(perturbation);
+                mainDir.lerp(new THREE.Vector3(0, 1, 0), config.apicalDominance).normalize();
                 mainDir = this._applyTropism(mainDir);
-                
-                // 子ノードを作成 (主枝)
                 const newLength = leaf.length * 0.9;
-                const newThickness = leaf.thickness * 0.85; // 子は少し細く
+                const newThickness = leaf.thickness * 0.85;
                 leaf.children.push(new Node(leaf, mainDir, newLength, newThickness, leaf.depth + 1));
-
-                // 2. 側枝の生成 (確率に基づく)
-                if (leaf.children.length < config.maxChildren && leaf.depth < 8 && Math.random() < config.branchingProbability) {
-                    this._addSideBranch(leaf, mainDir);
+                if (leaf.children.length < config.maxChildren && leaf.depth < 10 && Math.random() < config.branchingProbability) {
+                    this._addSideBranch(leaf);
                 }
             }
             
@@ -253,75 +296,60 @@
                 return false;
             }
 
-            // ★★★改善点: 側枝の生成ロジックを刷新★★★
-            _addSideBranch(node, mainDir = null) {
-                // 親の枝の方向を基準にする
-                const parentDir = mainDir ? mainDir.clone() : node.direction.clone();
-
-                // 親の枝に対して垂直に近い回転軸をランダムに生成する
-                let axis = new THREE.Vector3().crossVectors(parentDir, new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)).normalize();
-                if (axis.length() < 0.1) axis.set(1,0,0); // 平行な場合のエラー回避
-
-                // 側枝の方向を計算 (親の方向を、計算した軸で指定角度回転させる)
-                let sideDir = parentDir.clone().applyAxisAngle(axis, config.sideBranchAngle);
-
-                // 光と重力の影響を適用
-                sideDir = this._applyTropism(sideDir);
-
-                // 子ノードを作成 (側枝)
-                const newLength = node.length * (0.4 + Math.random() * 0.3);
-                const newThickness = node.thickness * 0.6; // 側枝はより細く
-                node.children.push(new Node(node, sideDir, newLength, newThickness, node.depth + 1));
+            _addSideBranch(node) {
+                const parentDir = node.direction.clone();
+                const parentQuaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), parentDir);
+                const angle = config.sideBranchAngle + (Math.random() - 0.5) * config.branchAngleVariance;
+                const sideDir = new THREE.Vector3(0, 1, 0);
+                sideDir.applyAxisAngle(new THREE.Vector3(1, 0, 0), angle);
+                sideDir.applyAxisAngle(new THREE.Vector3(0, 1, 0), node.roll);
+                sideDir.applyQuaternion(parentQuaternion);
+                const finalDir = this._applyTropism(sideDir);
+                const newLength = node.length * (0.5 + Math.random() * 0.3);
+                const newThickness = node.thickness * 0.6;
+                node.children.push(new Node(node, finalDir, newLength, newThickness, node.depth + 1));
+                node.roll += GOLDEN_ANGLE;
             }
             
-            // ★★★改善点: 重力計算を枝自身の傾きに依存するように変更★★★
             _applyTropism(dir) {
-                // 光周性
                 dir.lerp(this.sunLight.position.clone().normalize(), config.phototropismStrength).normalize();
-                // 重力 (水平に近い枝ほど強く影響)
                 const gravityFactor = config.gravityStrength * (1 - Math.abs(dir.y));
                 dir.lerp(new THREE.Vector3(0, -1, 0), gravityFactor).normalize();
                 return dir;
             }
 
-            _updateLeafStatus() { const d=this._getMaxDepth(); const t=(n)=>{n.hasLeaves=n.isLeaf||(d-n.depth<=3);n.children.forEach(t);};t(this.base);}
+            _updateLeafStatus() { const d=this._getMaxDepth(); const t=(n)=>{n.hasLeaves=n.isLeaf||(d-n.depth<=4);n.children.forEach(t);};t(this.base);}
 
-            // ★★★改善点: 太さの上限(maxThickness)を考慮した二次成長★★★
             _applySecondaryGrowth() {
                 const t = (n) => {
-                    // 成長量を計算（根元に近いほど太くなりやすい）
                     const growth = config.secondaryGrowthRate / (n.depth * 0.8 + 1);
-                    // 上限を超えないように太さを更新
                     n.thickness = Math.min(n.thickness + growth, config.maxThickness);
-                    // 長さも少し成長
                     n.length *= 1 + (config.lengthGrowthRate / (n.depth + 1));
                     n.children.forEach(t);
                 };
                 t(this.base);
             }
 
-            // --- 描画ロジック (葉の生成方法は変更なし) ---
             draw() {
                 while(this.branchGroup.children.length > 0) this.branchGroup.remove(this.branchGroup.children[0]);
                 this.allNodeEndpoints = [];
                 this.leafInfluencePoints = [];
                 this.pointCount = 0;
-                this._recursiveDrawAndCollect(this.base, new THREE.Vector3(0, -10, 0));
+                this.nodeCount = 0;
+                this._recursiveDrawAndCollect(this.base, this.basePosition);
                 this._generateLeavesFromInfluencePoints();
                 this.points.geometry.setDrawRange(0, this.pointCount);
                 this.points.geometry.attributes.position.needsUpdate = true;
             }
             
             _recursiveDrawAndCollect(node, parentEndPos) {
+                this.nodeCount++;
                 const startPos = parentEndPos;
                 const endPos = new THREE.Vector3().addVectors(startPos, node.direction.clone().setLength(node.length));
                 node.endPoint.copy(endPos);
                 this.allNodeEndpoints.push(endPos);
-                
-                // ★★★改善点: node.thicknessを直接使用して枝を描画★★★
                 const branchMesh = this._createCylinder(startPos, endPos, node.thickness, this.branchMaterial);
                 this.branchGroup.add(branchMesh);
-                
                 if (node.hasLeaves) {
                     for (let i = 0; i < config.influencePointsPerBranch; i++) {
                         const influencePoint = new THREE.Vector3().lerpVectors(startPos, endPos, Math.random());
@@ -336,7 +364,7 @@
                 const positions = this.points.geometry.attributes.position.array;
                 const totalPointsToGenerate = this.leafInfluencePoints.length * config.pointsPerInfluencePoint;
                 for (let i = 0; i < totalPointsToGenerate; i++) {
-                    if (this.pointCount >= config.maxPoints) break;
+                    if (this.pointCount >= config.maxPointsPerTree) break;
                     const anchorPoint = this.leafInfluencePoints[Math.floor(Math.random() * this.leafInfluencePoints.length)];
                     const scatter = config.leafScatter;
                     const x = anchorPoint.x + gaussianRandom(0, scatter);
@@ -348,6 +376,15 @@
                     positions[index + 2] = z;
                     this.pointCount++;
                 }
+            }
+            
+            // ★★★修正点: マテリアルも破棄する★★★
+            dispose() {
+                forestGroup.remove(this.branchGroup);
+                forestGroup.remove(this.points);
+                this.points.geometry.dispose();
+                this.points.material.dispose();
+                this.branchMaterial.dispose();
             }
 
             _findLeaves() { const l=[]; const t=(n)=>{if(n.isLeaf)l.push(n);n.children.forEach(t);};t(this.base); return l;}
@@ -362,59 +399,162 @@
                 const mesh=new THREE.Mesh(geo,material); mesh.castShadow=true; return mesh;
             }
         }
+        
+        function updateCameraTarget() {
+            if (trees.length === 0) {
+                cameraTarget.set(0, 15, 0);
+                return;
+            }
+            const centerOfForest = new THREE.Vector3();
+            trees.forEach(tree => {
+                centerOfForest.add(tree.basePosition);
+            });
+            centerOfForest.divideScalar(trees.length);
+            cameraTarget.set(centerOfForest.x, 15, centerOfForest.z);
+        }
+
+        // ★★★修正点: 新しい木を生成する際に遺伝情報を渡す★★★
+        function spawnNewTree(position, parentTree = null) {
+            if (trees.length >= config.maxTrees) return;
+            
+            let genetics;
+            if (parentTree) {
+                // 親がいる場合、親の遺伝子を突然変異させる
+                genetics = {
+                    leafColor: mutateColor(parentTree.genetics.leafColor, config.colorVariationFactor),
+                    branchColor: mutateColor(parentTree.genetics.branchColor, config.colorVariationFactor / 2) // 枝の色は変化を少し抑える
+                };
+            } else {
+                // 最初の木の場合、基本色から遺伝子を生成
+                genetics = {
+                    leafColor: new THREE.Color(config.baseLeafColor),
+                    branchColor: new THREE.Color(config.baseBranchColor)
+                };
+            }
+            
+            const newTree = new Tree(scene, sunLight, position, genetics);
+            trees.push(newTree);
+            updateCameraTarget();
+        }
 
         function init() {
+            if (simulationInterval) {
+                clearInterval(simulationInterval);
+                simulationInterval = null;
+                const button = document.getElementById('autoGrowButton');
+                button.textContent = 'シミュレーション Start';
+                button.style.backgroundColor = '#008CBA';
+            }
+
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x11111a);
-            scene.fog = new THREE.Fog(0x11111a, 30, 90);
+            scene.fog = new THREE.Fog(0x11111a, 50, 200);
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            camera.position.set(0, 5, 30);
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.shadowMap.enabled = true;
-            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-            document.body.appendChild(renderer.domElement);
+            camera.position.set(0, 15, 60);
+            
+            if (isFirstInit) {
+                renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.shadowMap.enabled = true;
+                renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                document.body.appendChild(renderer.domElement);
+            }
+            
+            trees.forEach(tree => tree.dispose());
+            if(forestGroup) scene.remove(forestGroup);
+            trees = [];
+
+            forestGroup = new THREE.Group();
+            scene.add(forestGroup);
+
             const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
             scene.add(ambientLight);
+            
             sunLight = new THREE.DirectionalLight(0xffffff, 0.9);
-            sunLight.position.set(10, 20, 15);
+            sunLight.position.set(20, 40, 30);
             sunLight.castShadow = true;
             sunLight.shadow.mapSize.set(2048, 2048);
+            sunLight.shadow.camera.left = -150;
+            sunLight.shadow.camera.right = 150;
+            sunLight.shadow.camera.top = 150;
+            sunLight.shadow.camera.bottom = -150;
+            sunLight.shadow.camera.near = 0.5;
+            sunLight.shadow.camera.far = 200; 
             scene.add(sunLight);
-            const ground = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), new THREE.MeshLambertMaterial({ color: 0x3a3a4a }));
+
+            const ground = new THREE.Mesh(new THREE.PlaneGeometry(500, 500), new THREE.MeshLambertMaterial({ color: 0x3a3a4a }));
             ground.rotation.x = -Math.PI / 2;
             ground.position.y = -10;
             ground.receiveShadow = true;
             scene.add(ground);
+
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
-            controls.target.set(0, 5, 0);
-            tree = new Tree(scene, sunLight);
-            setupEventListeners();
+            
+            updateCameraTarget();
+            controls.target.copy(cameraTarget);
+            
+            // ★★★修正点: 最初の木は親なしで生成★★★
+            spawnNewTree(new THREE.Vector3(0, -10, 0), null);
+            
+            if (isFirstInit) {
+                setupEventListeners();
+                animate();
+                isFirstInit = false;
+            }
         }
         
         function setupEventListeners() {
-            document.getElementById('growButton').addEventListener('click', () => tree.grow(10));
-            document.getElementById('resetButton').addEventListener('click', () => { if(autoGrowInterval) toggleAutoGrow(); tree.init(); });
-            document.getElementById('autoGrowButton').addEventListener('click', toggleAutoGrow);
+            document.getElementById('growButton').addEventListener('click', () => {
+                trees.forEach(tree => tree.grow(10));
+            });
+            document.getElementById('resetButton').addEventListener('click', init);
+            document.getElementById('autoGrowButton').addEventListener('click', toggleSimulation);
             document.getElementById('branchProb').addEventListener('input', (e) => config.branchingProbability = parseFloat(e.target.value));
             document.getElementById('apicalDom').addEventListener('input', (e) => config.apicalDominance = parseFloat(e.target.value));
             document.getElementById('phototropism').addEventListener('input', (e) => config.phototropismStrength = parseFloat(e.target.value));
             document.getElementById('gravity').addEventListener('input', (e) => config.gravityStrength = parseFloat(e.target.value));
-            document.getElementById('sparseBranch').addEventListener('input', (e) => config.sparseBranchingProbability = parseFloat(e.target.value));
+            
+            document.getElementById('speedSlider').addEventListener('input', (e) => {
+                config.simulationIntervalMs = 210 - parseInt(e.target.value, 10);
+                if (simulationInterval) {
+                    toggleSimulation();
+                    toggleSimulation();
+                }
+            });
+            
+            // ★★★修正点: 色の多様性スライダーのイベントリスナー★★★
+            document.getElementById('colorVariation').addEventListener('input', (e) => {
+                config.colorVariationFactor = parseFloat(e.target.value);
+            });
+
             window.addEventListener('resize', onWindowResize, false);
         }
 
-        function toggleAutoGrow() {
+        function toggleSimulation() {
             const button = document.getElementById('autoGrowButton');
-            if (autoGrowInterval) {
-                clearInterval(autoGrowInterval);
-                autoGrowInterval = null;
-                button.textContent = '自動成長 Start';
+            if (simulationInterval) {
+                clearInterval(simulationInterval);
+                simulationInterval = null;
+                button.textContent = 'シミュレーション Start';
                 button.style.backgroundColor = '#008CBA';
             } else {
-                autoGrowInterval = setInterval(() => tree.grow(3), 100);
-                button.textContent = '自動成長 Stop';
+                simulationInterval = setInterval(() => {
+                    trees.forEach(tree => {
+                        const result = tree.grow(3);
+                        if (result === 'matured') {
+                            const parentPos = tree.basePosition;
+                            const spawnAngle = Math.random() * Math.PI * 2;
+                            const spawnDist = config.spawnRadius * (0.7 + Math.random() * 0.6);
+                            const offset = new THREE.Vector3(Math.cos(spawnAngle) * spawnDist, 0, Math.sin(spawnAngle) * spawnDist);
+                            const newPos = new THREE.Vector3().addVectors(parentPos, offset);
+                            
+                            // ★★★修正点: 成熟した木を親として渡す★★★
+                            spawnNewTree(newPos, tree); 
+                        }
+                    });
+                }, config.simulationIntervalMs);
+                button.textContent = 'シミュレーション Stop';
                 button.style.backgroundColor = '#ff9800';
             }
         }
@@ -427,12 +567,12 @@
 
         function animate() {
             requestAnimationFrame(animate);
+            controls.target.lerp(cameraTarget, 0.05);
             controls.update();
             renderer.render(scene, camera);
         }
 
         init();
-        animate();
     </script>
 </body>
 </html>
