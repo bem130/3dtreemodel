@@ -92,6 +92,13 @@
         let simulationInterval = null;
         let isFirstInit = true;
         let cameraTarget = new THREE.Vector3(0, 15, 0);
+        
+        // ★★★ここから追加(当たり判定用)★★★
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+        let highlightedObject = null;
+        const highlightMaterial = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+        // ★★★ここまで追加★★★
 
         const config = {
             baseLeafColor: 0x208050,
@@ -362,6 +369,11 @@
                 node.endPoint.copy(endPos);
                 this.allNodeEndpoints.push(endPos);
                 const branchMesh = this._createCylinder(startPos, endPos, node.thickness, this.branchMaterial);
+
+                // ★★★ここから変更★★★
+                branchMesh.userData = { tree: this, node: node, originalMaterial: this.branchMaterial };
+                // ★★★ここまで変更★★★
+
                 this.branchGroup.add(branchMesh);
                 if (node.hasLeaves) {
                     for (let i = 0; i < config.influencePointsPerBranch; i++) {
@@ -464,7 +476,6 @@
             updateCameraTarget();
         }
 
-        // ★★★変更点: ここから(茂みを生成する関数)★★★
         function createShrubbery(shrubCount, grassPerShrub, scatterArea, shrubRadius) {
             const totalGrassCount = shrubCount * grassPerShrub;
             const grassGeometry = new THREE.ConeGeometry(0.15, 2.0, 4, 1);
@@ -506,7 +517,6 @@
             grassMesh.instanceMatrix.needsUpdate = true;
             forestGroup.add(grassMesh);
         }
-        // ★★★変更点: ここまで★★★
 
         function init() {
             if (simulationInterval) {
@@ -559,10 +569,7 @@
             ground.receiveShadow = true;
             scene.add(ground);
 
-            // ★★★変更点: ここから(茂み生成関数を呼び出す)★★★
-            // (茂みの数, 茂みあたりの草の数, 散布エリアの広さ, 個々の茂みの半径)
             createShrubbery(150, 40, 180, 4);
-            // ★★★変更点: ここまで★★★
 
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
@@ -616,15 +623,90 @@
                 const controls = document.getElementById('controls');
                 const btn = document.getElementById('togglePanelButton');
                 if (controls.style.display === 'none') {
-                    controls.style.display = '';
-                    btn.textContent = 'パネルを表示';
+                    controls.style.display = 'flex';
+                    btn.textContent = 'パネルを隠す';
                 } else {
                     controls.style.display = 'none';
                     btn.textContent = 'パネルを表示';
                 }
             });
             window.addEventListener('resize', onWindowResize, false);
+
+            // ★★★ここから追加★★★
+            window.addEventListener('mousemove', onMouseMove, false);
+            window.addEventListener('click', onMouseClick, false);
+            // ★★★ここまで追加★★★
         }
+
+        // ★★★ここから追加 (新しい関数) ★★★
+        function onMouseMove(event) {
+            // 他のUI操作中は無効にする
+            if(event.target.tagName === 'INPUT') return;
+            event.preventDefault();
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function onMouseClick(event) {
+             // 他のUI操作中は無効にする
+            if(event.target.tagName !== 'CANVAS') return;
+            event.preventDefault();
+            if (highlightedObject && highlightedObject.userData.node) {
+                const { tree, node } = highlightedObject.userData;
+                pruneBranch(tree, node);
+            }
+        }
+
+        function pruneBranch(tree, nodeToPrune) {
+            // 根のノードは剪定しない
+            if (!nodeToPrune.parent) {
+                console.log("Cannot prune the base of the tree.");
+                return;
+            }
+
+            const parentNode = nodeToPrune.parent;
+            const index = parentNode.children.indexOf(nodeToPrune);
+            if (index > -1) {
+                // ハイライトを元に戻す
+                if (highlightedObject) {
+                    highlightedObject.material = highlightedObject.userData.originalMaterial;
+                    highlightedObject = null;
+                }
+                
+                parentNode.children.splice(index, 1);
+                
+                // 剪定後に葉を持たなくなった枝が再び葉を持つようにフラグを更新
+                if (parentNode.children.length === 0) {
+                    parentNode.isLeaf = true;
+                }
+                
+                // 木全体を再描画して変更を反映
+                tree.draw();
+            }
+        }
+        
+        function checkIntersection() {
+            raycaster.setFromCamera(mouse, camera);
+
+            // forestGroup内の全ての子オブジェクト(木の枝グループや茂み)を再帰的に探索
+            const intersects = raycaster.intersectObjects(forestGroup.children, true);
+
+            // 前のフレームでハイライトしていたオブジェクトを元に戻す
+            if (highlightedObject) {
+                highlightedObject.material = highlightedObject.userData.originalMaterial;
+                highlightedObject = null;
+            }
+            
+            if (intersects.length > 0) {
+                const firstIntersected = intersects[0].object;
+                // userData.nodeが存在するオブジェクト(＝枝)のみを対象とする
+                if (firstIntersected.userData && firstIntersected.userData.node) { 
+                    highlightedObject = firstIntersected;
+                    highlightedObject.material = highlightMaterial;
+                }
+            }
+        }
+        // ★★★ここまで追加★★★
 
         function toggleSimulation() {
             const button = document.getElementById('autoGrowButton');
@@ -635,9 +717,11 @@
                 button.style.backgroundColor = '#008CBA';
             } else {
                 simulationInterval = setInterval(() => {
+                    let hasMatureTree = false;
                     trees.forEach(tree => {
                         const result = tree.liveStep();
-                        if (result === 'matured') {
+                        if (result === 'matured' && !hasMatureTree) {
+                             hasMatureTree = true;
                             const parentPos = tree.basePosition;
                             const spawnAngle = Math.random() * Math.PI * 2;
                             const spawnDist = config.spawnRadius * (0.7 + Math.random() * 0.6);
@@ -660,6 +744,11 @@
 
         function animate() {
             requestAnimationFrame(animate);
+
+            // ★★★ここから追加★★★
+            checkIntersection();
+            // ★★★ここまで追加★★★
+
             controls.target.lerp(cameraTarget, 0.05);
             controls.update();
             renderer.render(scene, camera);
