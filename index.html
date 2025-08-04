@@ -49,6 +49,7 @@
 </head>
 <body>
     <div id="info">マウスドラッグで回転 / ホイールでズーム</div>
+    <button id="togglePanelButton" style="position:absolute;top:10px;right:20px;z-index:101;padding:8px 16px;font-size:14px;border-radius:6px;background:#222;color:#fff;border:none;cursor:pointer;">パネルを隠す</button>
     <div id="controls">
         <div class="buttons">
             <button id="growButton">10ステップ成長</button>
@@ -66,9 +67,10 @@
             <input type="range" id="gravity" min="0.0" max="0.2" step="0.01" value="0.08">
             <label for="speedSlider">シミュレーション速度</label>
             <input type="range" id="speedSlider" min="10" max="200" step="10" value="100">
-            <!-- ★★★修正点: 色の多様性スライダーを追加★★★ -->
             <label for="colorVariation">色の多様性</label>
             <input type="range" id="colorVariation" min="0.0" max="0.2" step="0.01" value="0.05">
+            <label for="leafTurnover">葉の更新率</label>
+            <input type="range" id="leafTurnover" min="0.0" max="0.5" step="0.01" value="0.1">
         </div>
     </div>
 
@@ -87,21 +89,20 @@
 
         let scene, camera, renderer, controls, sunLight;
         let trees = [];
-        let forestGroup; 
+        let forestGroup;
         let simulationInterval = null;
         let isFirstInit = true;
         let cameraTarget = new THREE.Vector3(0, 15, 0);
 
         const config = {
-            // ★★★修正点: 色に関する設定を追加★★★
-            baseLeafColor: 0x208050,      // 葉の基本色
-            baseBranchColor: 0x8B4513,    // 枝の基本色
-            colorVariationFactor: 0.05, // 色の変化の度合い
-            
+            baseLeafColor: 0x208050,
+            baseBranchColor: 0x8B4513,
+            colorVariationFactor: 0.05,
             simulationIntervalMs: 100,
             maturityNodeCount: 450,
-            spawnRadius: 25,
-            maxTrees: 15,
+            spawnRadius: 50,
+            maxTrees: 30,
+            initialTreeCount: 5,
             branchingProbability: 0.6,
             apicalDominance: 0.2,
             phototropismStrength: 0.15,
@@ -118,28 +119,25 @@
             secondaryGrowthRate: 0.005,
             lengthGrowthRate: 0.01,
             maxPointsPerTree: 50000,
-            pointSize: 0.3,
-            influencePointsPerBranch: 4,
-            pointsPerInfluencePoint: 16,
+            pointSize: 0.5,
+            influencePointsPerBranch: 2,
+            pointsPerInfluencePoint: 10,
             leafScatter: 0.8,
+            leafTurnoverRate: 0.1,
+            leafUpdateChunk: 100,
         };
 
         const GOLDEN_ANGLE = Math.PI * (3.0 - Math.sqrt(5.0));
-
-        // ★★★追加: 色を突然変異させるヘルパー関数★★★
+        
         function mutateColor(baseColor, variation) {
             const newColor = new THREE.Color(baseColor);
             const hsl = {};
             newColor.getHSL(hsl);
-
-            // H(色相), S(彩度), L(輝度) を少しだけずらす
             hsl.h += (Math.random() - 0.5) * variation;
             if (hsl.h < 0) hsl.h += 1;
             if (hsl.h > 1) hsl.h -= 1;
-
             hsl.s = Math.max(0.3, Math.min(1.0, hsl.s + (Math.random() - 0.5) * variation));
             hsl.l = Math.max(0.2, Math.min(0.8, hsl.l + (Math.random() - 0.5) * variation));
-
             newColor.setHSL(hsl.h, hsl.s, hsl.l);
             return newColor;
         }
@@ -167,19 +165,17 @@
         }
 
         class Tree {
-            // ★★★修正点: コンストラクタで genetics (遺伝情報) を受け取る★★★
             constructor(scene, light, basePosition, genetics) {
                 this.scene = scene;
                 this.sunLight = light;
                 this.basePosition = basePosition;
-                this.genetics = genetics; // 自身の遺伝情報を保持
+                this.genetics = genetics;
                 this.isMature = false;
                 this.nodeCount = 0;
 
                 this.branchGroup = new THREE.Group();
                 forestGroup.add(this.branchGroup);
                 
-                // ★★★修正点: 遺伝情報に基づいて、木ごとにマテリアルを生成★★★
                 this.branchMaterial = new THREE.MeshLambertMaterial({ color: this.genetics.branchColor });
                 const pointsMaterial = new THREE.PointsMaterial({
                     color: this.genetics.leafColor, 
@@ -202,10 +198,22 @@
             }
 
             init() {
-                this.base = new Node(null, new THREE.Vector3(0, 1, 0), 2.5, config.initialThickness, 0);
+                this.base = new Node(null, new THREE.Vector3(Math.random()-0.5, Math.random()*5, Math.random()-0.5), 2.5, config.initialThickness, 0);
                 this.draw();
             }
-            // ... (grow, _growFromLightCompetitionなどのロジックは変更なし) ...
+
+            liveStep() {
+                if (this.isMature) {
+                    this._updateLeaves();
+                    this.points.geometry.setDrawRange(0, this.pointCount);
+                    this.points.geometry.attributes.position.needsUpdate = true;
+                    return false;
+                } else {
+                    const result = this.grow(1);
+                    return result;
+                }
+            }
+
             grow(steps = 1) {
                 if (this.isMature) return false;
                 let grown = false;
@@ -220,6 +228,7 @@
                     this.draw(); 
                     if (!this.isMature && this.nodeCount > config.maturityNodeCount) {
                         this.isMature = true;
+                        this._redrawBranches(); 
                         return 'matured';
                     }
                 }
@@ -331,15 +340,20 @@
             }
 
             draw() {
-                while(this.branchGroup.children.length > 0) this.branchGroup.remove(this.branchGroup.children[0]);
-                this.allNodeEndpoints = [];
-                this.leafInfluencePoints = [];
-                this.pointCount = 0;
-                this.nodeCount = 0;
-                this._recursiveDrawAndCollect(this.base, this.basePosition);
-                this._generateLeavesFromInfluencePoints();
+                this._redrawBranches();
+                this._updateLeaves();
                 this.points.geometry.setDrawRange(0, this.pointCount);
                 this.points.geometry.attributes.position.needsUpdate = true;
+            }
+
+            _redrawBranches() {
+                 while(this.branchGroup.children.length > 0) this.branchGroup.remove(this.branchGroup.children[0]);
+                
+                this.allNodeEndpoints = [];
+                this.leafInfluencePoints = [];
+                this.nodeCount = 0;
+
+                this._recursiveDrawAndCollect(this.base, this.basePosition);
             }
             
             _recursiveDrawAndCollect(node, parentEndPos) {
@@ -359,26 +373,43 @@
                 node.children.forEach(child => this._recursiveDrawAndCollect(child, endPos));
             }
 
-            _generateLeavesFromInfluencePoints() {
-                if (this.leafInfluencePoints.length === 0) return;
+            _updateLeaves() {
+                if (this.leafInfluencePoints.length === 0) {
+                    this.pointCount = 0;
+                    return;
+                }
                 const positions = this.points.geometry.attributes.position.array;
-                const totalPointsToGenerate = this.leafInfluencePoints.length * config.pointsPerInfluencePoint;
-                for (let i = 0; i < totalPointsToGenerate; i++) {
-                    if (this.pointCount >= config.maxPointsPerTree) break;
-                    const anchorPoint = this.leafInfluencePoints[Math.floor(Math.random() * this.leafInfluencePoints.length)];
-                    const scatter = config.leafScatter;
-                    const x = anchorPoint.x + gaussianRandom(0, scatter);
-                    const y = anchorPoint.y + gaussianRandom(0, scatter);
-                    const z = anchorPoint.z + gaussianRandom(0, scatter);
-                    const index = this.pointCount * 3;
-                    positions[index] = x;
-                    positions[index + 1] = y;
-                    positions[index + 2] = z;
-                    this.pointCount++;
+                const targetPointCount = Math.min(config.maxPointsPerTree, this.leafInfluencePoints.length * config.pointsPerInfluencePoint);
+                const turnoverCount = Math.floor(this.pointCount * config.leafTurnoverRate);
+                for (let i = 0; i < turnoverCount; i++) {
+                    const indexToUpdate = Math.floor(Math.random() * this.pointCount);
+                    this._generateSingleLeaf(indexToUpdate, positions);
+                }
+                if (this.pointCount < targetPointCount) {
+                    const newPointsCount = Math.min(targetPointCount - this.pointCount, config.leafUpdateChunk);
+                    const startIndex = this.pointCount;
+                    for (let i = 0; i < newPointsCount; i++) {
+                        this._generateSingleLeaf(startIndex + i, positions);
+                    }
+                    this.pointCount += newPointsCount;
+                } else if (this.pointCount > targetPointCount) {
+                     this.pointCount = Math.max(targetPointCount, this.pointCount - config.leafUpdateChunk);
                 }
             }
-            
-            // ★★★修正点: マテリアルも破棄する★★★
+
+            _generateSingleLeaf(index, positions) {
+                if (this.leafInfluencePoints.length === 0) return;
+                const anchorPoint = this.leafInfluencePoints[Math.floor(Math.random() * this.leafInfluencePoints.length)];
+                const scatter = config.leafScatter;
+                const x = anchorPoint.x + gaussianRandom(0, scatter);
+                const y = anchorPoint.y + gaussianRandom(0, scatter);
+                const z = anchorPoint.z + gaussianRandom(0, scatter);
+                const bufferIndex = index * 3;
+                positions[bufferIndex] = x;
+                positions[bufferIndex + 1] = y;
+                positions[bufferIndex + 2] = z;
+            }
+
             dispose() {
                 forestGroup.remove(this.branchGroup);
                 forestGroup.remove(this.points);
@@ -413,19 +444,16 @@
             cameraTarget.set(centerOfForest.x, 15, centerOfForest.z);
         }
 
-        // ★★★修正点: 新しい木を生成する際に遺伝情報を渡す★★★
         function spawnNewTree(position, parentTree = null) {
             if (trees.length >= config.maxTrees) return;
             
             let genetics;
             if (parentTree) {
-                // 親がいる場合、親の遺伝子を突然変異させる
                 genetics = {
                     leafColor: mutateColor(parentTree.genetics.leafColor, config.colorVariationFactor),
-                    branchColor: mutateColor(parentTree.genetics.branchColor, config.colorVariationFactor / 2) // 枝の色は変化を少し抑える
+                    branchColor: mutateColor(parentTree.genetics.branchColor, config.colorVariationFactor / 2)
                 };
             } else {
-                // 最初の木の場合、基本色から遺伝子を生成
                 genetics = {
                     leafColor: new THREE.Color(config.baseLeafColor),
                     branchColor: new THREE.Color(config.baseBranchColor)
@@ -491,11 +519,23 @@
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             
+            // ★★★変更点: ここから★★★
+            // 最初に中央のエリアに複数の木を生成する
+            const initialTreeCount = Math.min(config.initialTreeCount, config.maxTrees);
+            for (let i = 0; i < initialTreeCount; i++) {
+                const spawnAngle = Math.random() * Math.PI * 2;
+                const spawnDist = config.spawnRadius * Math.random();
+                const position = new THREE.Vector3(
+                    Math.cos(spawnAngle) * spawnDist,
+                    -10, // 地面の高さ
+                    Math.sin(spawnAngle) * spawnDist
+                );
+                spawnNewTree(position, null);
+            }
+            // ★★★変更点: ここまで★★★
+            
             updateCameraTarget();
             controls.target.copy(cameraTarget);
-            
-            // ★★★修正点: 最初の木は親なしで生成★★★
-            spawnNewTree(new THREE.Vector3(0, -10, 0), null);
             
             if (isFirstInit) {
                 setupEventListeners();
@@ -514,7 +554,6 @@
             document.getElementById('apicalDom').addEventListener('input', (e) => config.apicalDominance = parseFloat(e.target.value));
             document.getElementById('phototropism').addEventListener('input', (e) => config.phototropismStrength = parseFloat(e.target.value));
             document.getElementById('gravity').addEventListener('input', (e) => config.gravityStrength = parseFloat(e.target.value));
-            
             document.getElementById('speedSlider').addEventListener('input', (e) => {
                 config.simulationIntervalMs = 210 - parseInt(e.target.value, 10);
                 if (simulationInterval) {
@@ -522,12 +561,23 @@
                     toggleSimulation();
                 }
             });
-            
-            // ★★★修正点: 色の多様性スライダーのイベントリスナー★★★
             document.getElementById('colorVariation').addEventListener('input', (e) => {
                 config.colorVariationFactor = parseFloat(e.target.value);
             });
-
+            document.getElementById('leafTurnover').addEventListener('input', (e) => {
+                config.leafTurnoverRate = parseFloat(e.target.value);
+            });
+            document.getElementById('togglePanelButton').addEventListener('click', () => {
+                const controls = document.getElementById('controls');
+                const btn = document.getElementById('togglePanelButton');
+                if (controls.style.display === 'none') {
+                    controls.style.display = '';
+                    btn.textContent = 'パネルを隠す';
+                } else {
+                    controls.style.display = 'none';
+                    btn.textContent = 'パネルを表示';
+                }
+            });
             window.addEventListener('resize', onWindowResize, false);
         }
 
@@ -541,15 +591,13 @@
             } else {
                 simulationInterval = setInterval(() => {
                     trees.forEach(tree => {
-                        const result = tree.grow(3);
+                        const result = tree.liveStep();
                         if (result === 'matured') {
                             const parentPos = tree.basePosition;
                             const spawnAngle = Math.random() * Math.PI * 2;
                             const spawnDist = config.spawnRadius * (0.7 + Math.random() * 0.6);
                             const offset = new THREE.Vector3(Math.cos(spawnAngle) * spawnDist, 0, Math.sin(spawnAngle) * spawnDist);
                             const newPos = new THREE.Vector3().addVectors(parentPos, offset);
-                            
-                            // ★★★修正点: 成熟した木を親として渡す★★★
                             spawnNewTree(newPos, tree); 
                         }
                     });
